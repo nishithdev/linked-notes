@@ -99,6 +99,24 @@ class ThoughtsAPI {
       };
     }
   }
+
+  // Check for updates since a specific timestamp
+  async checkSync(since) {
+    try {
+      const params = since ? `?since=${encodeURIComponent(since)}` : '';
+      const response = await this.request(`/api/sync${params}`);
+      return {
+        success: true,
+        ...response
+      };
+    } catch (error) {
+      console.error('Failed to check sync:', error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
 }
 
 export const thoughtsAPI = new ThoughtsAPI();
