@@ -996,6 +996,14 @@ body {
   background: rgba(255, 193, 7, 0.1);
 }
 
+.sync-conflicts {
+  font-size: 10px;
+  color: #ffc107;
+  text-align: center;
+  margin-top: 4px;
+  opacity: 0.9;
+}
+
 @media (max-width: 768px) {
   .app {
     flex-direction: column;
