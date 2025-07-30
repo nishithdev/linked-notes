@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, Plus, Eye, Network, Save, Trash2, Link, X, Users, Download, Upload, GitBranch, RotateCcw, Calendar, ZoomIn, Map } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import Fuse from 'fuse.js';
@@ -28,10 +28,19 @@ const App = () => {
   const [autoSaveStatus, setAutoSaveStatus] = useState('saved'); // 'saving', 'saved', 'error'
   const [serverStatus, setServerStatus] = useState('unknown'); // 'online', 'offline', 'unknown'
   const [lastSyncTime, setLastSyncTime] = useState(null); // Track last sync timestamp
+  const [lastServerModified, setLastServerModified] = useState(null); // Track server's last modified time
+  const [syncConflicts, setSyncConflicts] = useState(0); // Track sync conflicts
   const fileInputRef = useRef(null);
   const autoSaveTimeoutRef = useRef(null);
+  const syncIntervalRef = useRef(null);
   const graphRef = useRef(null);
   const minimapRef = useRef(null);
+  const currentThoughtsRef = useRef(thoughts); // Track current thoughts without causing re-renders
+
+  // Update ref when thoughts change
+  useEffect(() => {
+    currentThoughtsRef.current = thoughts;
+  }, [thoughts]);
 
   // Handle window resize and calculate dimensions
   useEffect(() => {
@@ -78,6 +87,7 @@ const App = () => {
         setAutoSaveStatus('saved');
         setServerStatus('online');
         setLastSyncTime(new Date());
+        setLastServerModified(result.lastModified); // Track server's last modified time
         console.log('Thoughts auto-saved to server at', new Date().toLocaleTimeString());
       } else {
         throw new Error(result.error || 'Failed to save to server');
@@ -139,6 +149,7 @@ const App = () => {
             setThoughts(result.thoughts);
             setFilteredThoughts(result.thoughts);
             setLastSyncTime(new Date());
+            setLastServerModified(result.lastModified); // Track server's last modified time
             console.log(`Successfully loaded ${result.thoughts.length} thoughts from server`);
             
             // Also sync to localStorage
@@ -217,36 +228,73 @@ const App = () => {
     setAutoSaveStatus('saving');
     
     try {
-      // Check server status
-      const statusCheck = await thoughtsAPI.checkStatus();
-      setServerStatus(statusCheck.online ? 'online' : 'offline');
-      
-      if (statusCheck.online) {
-        // Load latest from server
-        const result = await thoughtsAPI.loadThoughts();
-        
-        if (result.success) {
-          setThoughts(result.thoughts);
-          setFilteredThoughts(result.thoughts);
-          setAutoSaveStatus('saved');
-          setLastSyncTime(new Date());
-          console.log(`Manual sync: loaded ${result.thoughts.length} thoughts from server`);
-          
-          // Update localStorage
-          localStorage.setItem('thoughts-graph-data', JSON.stringify(result.thoughts));
-          localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
-        } else {
-          throw new Error(result.error);
-        }
-      } else {
-        throw new Error('Server is offline');
-      }
+      // Use the checkForUpdates function which handles conflicts
+      await checkForUpdates();
+      setAutoSaveStatus('saved');
     } catch (error) {
       console.error('Manual sync failed:', error);
       setAutoSaveStatus('error');
       setServerStatus('offline');
     }
   };
+
+  // Check for server updates periodically
+  const checkForUpdates = useCallback(async () => {
+    if (serverStatus === 'offline') return;
+    
+    try {
+      const result = await thoughtsAPI.checkSync(lastServerModified);
+      
+      if (result.success && result.hasUpdates) {
+        console.log('Server has updates, checking for changes...');
+        
+        // Use ref to get current thoughts without dependency issues
+        const currentThoughts = currentThoughtsRef.current;
+        const localDataString = JSON.stringify(currentThoughts);
+        const serverDataString = JSON.stringify(result.thoughts);
+        
+        // Only update UI if data is actually different
+        if (localDataString !== serverDataString) {
+          console.log('Data has changed, updating UI...');
+          
+          // Check for conflicts (local changes exist but server has newer data)
+          if (currentThoughts.length > 0) {
+            console.warn('Sync conflict detected');
+            setSyncConflicts(prev => prev + 1);
+          }
+          
+          // Update with server data
+          setThoughts(result.thoughts);
+          setFilteredThoughts(result.thoughts);
+          setLastSyncTime(new Date());
+          
+          // Also update localStorage
+          localStorage.setItem('thoughts-graph-data', JSON.stringify(result.thoughts));
+          localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
+          
+          console.log(`Synced ${result.thoughts.length} thoughts from server`);
+        } else {
+          console.log('Data unchanged, no UI update needed');
+        }
+        
+        // Always update the server's last modified time, even if data unchanged
+        setLastServerModified(result.lastModified);
+        
+      } else if (result.success) {
+        // No updates available
+        console.log('No server updates available');
+        // Only update server status if it changed
+        if (serverStatus !== 'online') {
+          setServerStatus('online');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check for updates:', error);
+      if (serverStatus !== 'offline') {
+        setServerStatus('offline');
+      }
+    }
+  }, [serverStatus, lastServerModified]); // Removed thoughts dependency
 
   // Helper function to format last sync time
   const formatLastSyncTime = () => {
@@ -1015,6 +1063,28 @@ const App = () => {
     return parts.length > 1 ? parts : text;
   };
 
+  // Set up periodic sync checking
+  useEffect(() => {
+    // Start periodic sync checking every 10 seconds
+    syncIntervalRef.current = setInterval(checkForUpdates, 10000);
+    
+    // Also check when the page becomes visible again
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        checkForUpdates();
+      }
+    };
+    
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    
+    return () => {
+      if (syncIntervalRef.current) {
+        clearInterval(syncIntervalRef.current);
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [checkForUpdates]); // Only depend on the memoized function
+
   return (
     <div className="app">
       {/* Sidebar */}
@@ -1082,6 +1152,11 @@ const App = () => {
                 {serverStatus === 'unknown' && '⚪ Unknown'}
               </span>
             </div>
+            {syncConflicts > 0 && (
+              <div className="sync-conflicts">
+                ⚠️ {syncConflicts} sync conflict{syncConflicts > 1 ? 's' : ''} resolved (server data used)
+              </div>
+            )}
           </div>
           
           <input
