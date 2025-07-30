@@ -5,6 +5,7 @@ import Fuse from 'fuse.js';
 import ForceGraph2D from 'react-force-graph-2d';
 import { hierarchy, tree, cluster } from 'd3-hierarchy';
 import { parseISO, differenceInDays } from 'date-fns';
+import thoughtsAPI from './services/api';
 
 const App = () => {
   const [thoughts, setThoughts] = useState([]);
@@ -24,6 +25,9 @@ const App = () => {
   // New state for minimap and zoom functionality
   const [showMinimap, setShowMinimap] = useState(true);
   const [minimapDimensions] = useState({ width: 200, height: 150 });
+  const [autoSaveStatus, setAutoSaveStatus] = useState('saved'); // 'saving', 'saved', 'error'
+  const [serverStatus, setServerStatus] = useState('unknown'); // 'online', 'offline', 'unknown'
+  const [lastSyncTime, setLastSyncTime] = useState(null); // Track last sync timestamp
   const fileInputRef = useRef(null);
   const autoSaveTimeoutRef = useRef(null);
   const graphRef = useRef(null);
@@ -56,6 +60,45 @@ const App = () => {
     linkElement.click();
   };
 
+  // Auto-save to server and local backup
+  const autoSaveToJSON = async () => {
+    if (thoughts.length === 0) return;
+    
+    setAutoSaveStatus('saving');
+    
+    try {
+      // Save to server first
+      const result = await thoughtsAPI.saveThoughts(thoughts);
+      
+      if (result.success) {
+        // Also save to localStorage as backup
+        localStorage.setItem('thoughts-graph-data', JSON.stringify(thoughts));
+        localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
+        
+        setAutoSaveStatus('saved');
+        setServerStatus('online');
+        setLastSyncTime(new Date());
+        console.log('Thoughts auto-saved to server at', new Date().toLocaleTimeString());
+      } else {
+        throw new Error(result.error || 'Failed to save to server');
+      }
+    } catch (error) {
+      console.error('Error auto-saving thoughts to server:', error);
+      
+      // Fallback to localStorage only
+      try {
+        localStorage.setItem('thoughts-graph-data', JSON.stringify(thoughts));
+        localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
+        setAutoSaveStatus('saved');
+        setServerStatus('offline');
+        console.log('Thoughts saved to local storage (server offline)');
+      } catch (localError) {
+        console.error('Failed to save to localStorage:', localError);
+        setAutoSaveStatus('error');
+      }
+    }
+  };
+
   const loadFromJSON = (event) => {
     const file = event.target.files[0];
     if (file) {
@@ -74,29 +117,164 @@ const App = () => {
     }
   };
 
-  // Load thoughts from localStorage on component mount
+  // Load thoughts from server on component mount
   useEffect(() => {
-    const savedThoughts = localStorage.getItem('thoughts-graph-data');
-    if (savedThoughts) {
+    const loadInitialThoughts = async () => {
+      console.log('Starting initial data load...');
+      
       try {
-        const parsedThoughts = JSON.parse(savedThoughts);
-        setThoughts(parsedThoughts);
-        setFilteredThoughts(parsedThoughts);
+        // First check server status
+        console.log('Checking server status...');
+        const statusCheck = await thoughtsAPI.checkStatus();
+        console.log('Server status:', statusCheck);
+        setServerStatus(statusCheck.online ? 'online' : 'offline');
+        
+        if (statusCheck.online) {
+          // Load from server
+          console.log('Loading thoughts from server...');
+          const result = await thoughtsAPI.loadThoughts();
+          console.log('Server load result:', result);
+          
+          if (result.success) {
+            setThoughts(result.thoughts);
+            setFilteredThoughts(result.thoughts);
+            setLastSyncTime(new Date());
+            console.log(`Successfully loaded ${result.thoughts.length} thoughts from server`);
+            
+            // Also sync to localStorage
+            localStorage.setItem('thoughts-graph-data', JSON.stringify(result.thoughts));
+            localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
+            return;
+          }
+        }
+        
+        // Fallback to localStorage
+        console.log('Falling back to localStorage...');
+        const savedThoughts = localStorage.getItem('thoughts-graph-data');
+        const lastSaveTime = localStorage.getItem('thoughts-graph-autosave-timestamp');
+        
+        if (savedThoughts) {
+          try {
+            const parsedThoughts = JSON.parse(savedThoughts);
+            setThoughts(parsedThoughts);
+            setFilteredThoughts(parsedThoughts);
+            console.log(`Loaded ${parsedThoughts.length} thoughts from localStorage`);
+            
+            if (lastSaveTime) {
+              const saveDate = new Date(lastSaveTime);
+              setLastSyncTime(saveDate);
+              console.log('Last local save time:', saveDate.toLocaleString());
+            }
+          } catch (error) {
+            console.error('Error parsing saved thoughts:', error);
+          }
+        } else {
+          console.log('No saved thoughts found');
+        }
+        
       } catch (error) {
-        console.error('Error parsing saved thoughts:', error);
+        console.error('Error loading initial thoughts:', error);
+        setServerStatus('offline');
+        
+        // Try localStorage as final fallback
+        const savedThoughts = localStorage.getItem('thoughts-graph-data');
+        if (savedThoughts) {
+          try {
+            const parsedThoughts = JSON.parse(savedThoughts);
+            setThoughts(parsedThoughts);
+            setFilteredThoughts(parsedThoughts);
+            console.log(`Fallback: loaded ${parsedThoughts.length} thoughts from localStorage`);
+          } catch (error) {
+            console.error('Error parsing local thoughts:', error);
+          }
+        }
       }
-    }
+    };
+    
+    loadInitialThoughts();
   }, []);
 
-  // Auto-save thoughts to localStorage with debouncing
+  // Function to download current auto-saved data
+  const downloadAutoSave = () => {
+    const savedThoughts = localStorage.getItem('thoughts-graph-data');
+    const lastSaveTime = localStorage.getItem('thoughts-graph-autosave-timestamp');
+    
+    if (savedThoughts) {
+      const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(savedThoughts);
+      const saveDate = lastSaveTime ? new Date(lastSaveTime).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+      const exportFileDefaultName = `thoughts-autosave-${saveDate}.json`;
+      
+      const linkElement = document.createElement('a');
+      linkElement.setAttribute('href', dataUri);
+      linkElement.setAttribute('download', exportFileDefaultName);
+      linkElement.click();
+    }
+  };
+
+  // Manual sync function
+  const manualSync = async () => {
+    console.log('Manual sync triggered...');
+    setAutoSaveStatus('saving');
+    
+    try {
+      // Check server status
+      const statusCheck = await thoughtsAPI.checkStatus();
+      setServerStatus(statusCheck.online ? 'online' : 'offline');
+      
+      if (statusCheck.online) {
+        // Load latest from server
+        const result = await thoughtsAPI.loadThoughts();
+        
+        if (result.success) {
+          setThoughts(result.thoughts);
+          setFilteredThoughts(result.thoughts);
+          setAutoSaveStatus('saved');
+          setLastSyncTime(new Date());
+          console.log(`Manual sync: loaded ${result.thoughts.length} thoughts from server`);
+          
+          // Update localStorage
+          localStorage.setItem('thoughts-graph-data', JSON.stringify(result.thoughts));
+          localStorage.setItem('thoughts-graph-autosave-timestamp', new Date().toISOString());
+        } else {
+          throw new Error(result.error);
+        }
+      } else {
+        throw new Error('Server is offline');
+      }
+    } catch (error) {
+      console.error('Manual sync failed:', error);
+      setAutoSaveStatus('error');
+      setServerStatus('offline');
+    }
+  };
+
+  // Helper function to format last sync time
+  const formatLastSyncTime = () => {
+    if (!lastSyncTime) return 'Never';
+    
+    const now = new Date();
+    const diffMs = now - lastSyncTime;
+    const diffMinutes = Math.floor(diffMs / (1000 * 60));
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+    
+    if (diffMinutes < 1) return 'Just now';
+    if (diffMinutes < 60) return `${diffMinutes}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    
+    return lastSyncTime.toLocaleDateString();
+  };
+
+  // Auto-save thoughts to JSON with debouncing
   useEffect(() => {
     if (autoSaveTimeoutRef.current) {
       clearTimeout(autoSaveTimeoutRef.current);
     }
     
     autoSaveTimeoutRef.current = setTimeout(() => {
-      localStorage.setItem('thoughts-graph-data', JSON.stringify(thoughts));
-    }, 1000); // Auto-save after 1 second of inactivity
+      autoSaveToJSON(); // Use the new auto-save function
+    }, 2000); // Auto-save after 2 seconds of inactivity
 
     return () => {
       if (autoSaveTimeoutRef.current) {
@@ -581,14 +759,23 @@ const App = () => {
         }));
 
         const links = [];
+        let linkIndex = 0;
         thoughts.forEach(thought => {
           thought.connections.forEach(connId => {
             if (thoughts.find(t => t.id === connId)) {
+              const linkColor = generateLinkColor(thought.id, connId, linkIndex);
               links.push({
                 source: thought.id,
                 target: connId,
                 value: 1,
+                color: linkColor,
+                index: linkIndex,
+                // Add metadata for enhanced visualization
+                sourceTitle: thought.title,
+                targetTitle: thoughts.find(t => t.id === connId)?.title || 'Unknown',
+                connectionStrength: Math.min(thought.connections.length, thoughts.find(t => t.id === connId)?.connections.length || 0)
               });
+              linkIndex++;
             }
           });
         });
@@ -679,6 +866,57 @@ const App = () => {
       thought.id !== selectedThought.id && 
       !selectedThought.connections.includes(thought.id)
     );
+  };
+
+  // Generate unique colors for links based on connection type and strength
+  const generateLinkColor = (sourceNode, targetNode, linkIndex) => {
+    // Color palette for different types of connections
+    const colors = [
+      'rgba(255, 100, 100, 0.7)',  // Red variants
+      'rgba(100, 255, 100, 0.7)',  // Green variants
+      'rgba(100, 100, 255, 0.7)',  // Blue variants
+      'rgba(255, 255, 100, 0.7)',  // Yellow variants
+      'rgba(255, 100, 255, 0.7)',  // Magenta variants
+      'rgba(100, 255, 255, 0.7)',  // Cyan variants
+      'rgba(255, 150, 100, 0.7)',  // Orange variants
+      'rgba(150, 100, 255, 0.7)',  // Purple variants
+      'rgba(255, 200, 100, 0.7)',  // Gold variants
+      'rgba(100, 255, 150, 0.7)',  // Lime variants
+    ];
+
+    // Hash function to generate consistent color for same connection
+    const hash = (str) => {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+      }
+      return Math.abs(hash);
+    };
+
+    // Create consistent color based on node pair
+    const connectionId = [sourceNode, targetNode].sort().join('-');
+    const colorIndex = hash(connectionId) % colors.length;
+    
+    return colors[colorIndex];
+  };
+
+  // Enhanced link width calculation
+  const calculateLinkWidth = (link) => {
+    // Find the source and target thoughts
+    const sourceThought = thoughts.find(t => t.id === (typeof link.source === 'object' ? link.source.id : link.source));
+    const targetThought = thoughts.find(t => t.id === (typeof link.target === 'object' ? link.target.id : link.target));
+    
+    if (!sourceThought || !targetThought) return 2;
+    
+    // Calculate width based on mutual connections
+    const sourceConnections = sourceThought.connections.length;
+    const targetConnections = targetThought.connections.length;
+    const averageConnections = (sourceConnections + targetConnections) / 2;
+    
+    // Width varies from 1 to 4 based on connection strength
+    return Math.max(1, Math.min(4, 2 + averageConnections * 0.3));
   };
 
   // Helper function to highlight @-mentions in text
@@ -807,6 +1045,43 @@ const App = () => {
               <Download size={14} />
               Export
             </button>
+            <button 
+              className="auto-save-btn" 
+              onClick={downloadAutoSave}
+              title="Download auto-saved data"
+            >
+              <Save size={14} />
+              Auto-Save
+            </button>
+            <button 
+              className="sync-btn" 
+              onClick={manualSync}
+              title="Sync with server"
+              disabled={autoSaveStatus === 'saving'}
+            >
+              <RotateCcw size={14} />
+              Sync
+            </button>
+          </div>
+          
+          <div className="auto-save-status">
+            <div className="status-line">
+              <span className={`auto-save-indicator ${autoSaveStatus}`}>
+                {autoSaveStatus === 'saving' && '⏳ Saving...'}
+                {autoSaveStatus === 'saved' && (
+                  serverStatus === 'online' ? '✅ Synced' : '💾 Local'
+                )}
+                {autoSaveStatus === 'error' && '❌ Error'}
+              </span>
+              <span className="last-sync-time">
+                🕒 {formatLastSyncTime()}
+              </span>
+              <span className={`server-status ${serverStatus}`}>
+                {serverStatus === 'online' && '🟢 Online'}
+                {serverStatus === 'offline' && '🔴 Offline'}
+                {serverStatus === 'unknown' && '⚪ Unknown'}
+              </span>
+            </div>
           </div>
           
           <input
@@ -947,6 +1222,9 @@ const App = () => {
               </div>
               
               <div className="graph-actions">
+                <div className="color-info" title="Each connection has a unique color based on the connected thoughts">
+                  🎨 Unique Link Colors
+                </div>
                 <button
                   className="action-btn"
                   onClick={() => setShowMinimap(!showMinimap)}
@@ -1004,8 +1282,65 @@ const App = () => {
                       }
                     }}
                     onNodeClick={handleNodeClick}
-                    linkColor={() => 'rgba(255, 50, 50, 0.6)'}
-                    linkWidth={2}
+                    onBackgroundClick={() => {
+                      // Deselect thought when clicking on empty space
+                      setSelectedThought(null);
+                    }}
+                    linkColor={(link) => {
+                      // Use the color stored in link data, with fallback
+                      if (link.color) {
+                        return link.color;
+                      }
+                      // Fallback to generating color based on nodes
+                      const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+                      const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+                      return generateLinkColor(sourceId, targetId, link.index || 0);
+                    }}
+                    linkWidth={(link) => calculateLinkWidth(link)}
+                    linkLabel={(link) => {
+                      // Enhanced link tooltips
+                      const sourceTitle = link.sourceTitle || (typeof link.source === 'object' ? link.source.name : link.source);
+                      const targetTitle = link.targetTitle || (typeof link.target === 'object' ? link.target.name : link.target);
+                      return `
+                        <div style="
+                          padding: 8px 12px; 
+                          background: rgba(20, 20, 20, 0.95); 
+                          border: 1px solid rgba(255, 255, 255, 0.3); 
+                          border-radius: 6px; 
+                          color: white; 
+                          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                          font-size: 12px;
+                          max-width: 250px;
+                          text-align: center;
+                        ">
+                          <div style="font-weight: 600; margin-bottom: 4px;">
+                            ${sourceTitle} ↔ ${targetTitle}
+                          </div>
+                          <div style="color: #cccccc; font-size: 10px;">
+                            Connection strength: ${link.connectionStrength || 1}
+                          </div>
+                        </div>
+                      `;
+                    }}
+                    linkDirectionalParticles={(link) => {
+                      // More particles for stronger connections
+                      return selectedThought && 
+                             (link.source === selectedThought.id || 
+                              link.target === selectedThought.id || 
+                              link.source.id === selectedThought.id || 
+                              link.target.id === selectedThought.id) ? 4 : 2;
+                    }}
+                    linkDirectionalParticleSpeed={0.006}
+                    linkDirectionalParticleWidth={2}
+                    linkDirectionalParticleColor={(link) => {
+                      // Particles match link color but more opaque
+                      const baseColor = link.color || generateLinkColor(link.source, link.target, link.index || 0);
+                      return baseColor.replace('0.7)', '1)'); // Make particles fully opaque
+                    }}
+                    onLinkHover={(link) => {
+                      // Highlight connected nodes when hovering over links
+                      document.body.style.cursor = link ? 'pointer' : 'default';
+                    }}
                     backgroundColor="rgba(0,0,0,0.8)"
                     width={dimensions.width}
                     height={dimensions.height}
@@ -1015,6 +1350,20 @@ const App = () => {
                     cooldownTicks={graphLayout === 'force' ? 100 : 0}
                     d3AlphaDecay={graphLayout === 'force' ? 0.0228 : 1}
                     d3VelocityDecay={graphLayout === 'force' ? 0.4 : 1}
+                    d3ForceConfig={{
+                      charge: {
+                        strength: -300, // Increased repulsion between nodes
+                        distanceMin: 50, // Minimum distance before repulsion starts
+                        distanceMax: 500 // Maximum distance for repulsion effect
+                      },
+                      link: {
+                        distance: 150, // Increased link distance for more spacing
+                        strength: 0.5 // Link strength
+                      },
+                      center: {
+                        strength: 0.3 // Centering force strength
+                      }
+                    }}
                   ref={graphRef}
                   onEngineStop={() => {
                     if (graphLayout !== 'force') {
@@ -1072,8 +1421,17 @@ const App = () => {
                             }
                           }
                         }}
-                        linkColor={() => 'rgba(255, 50, 50, 0.4)'}
-                        linkWidth={1}
+                        linkColor={(link) => {
+                          // Use unique colors in minimap too, but with reduced opacity
+                          const baseColor = link.color || generateLinkColor(
+                            typeof link.source === 'object' ? link.source.id : link.source,
+                            typeof link.target === 'object' ? link.target.id : link.target,
+                            link.index || 0
+                          );
+                          // Reduce opacity for minimap
+                          return baseColor.replace('0.7)', '0.5)');
+                        }}
+                        linkWidth={1.5}
                         backgroundColor="rgba(0,0,0,0.9)"
                         width={minimapDimensions.width}
                         height={minimapDimensions.height}
@@ -1083,6 +1441,20 @@ const App = () => {
                         cooldownTicks={0}
                         d3AlphaDecay={1}
                         d3VelocityDecay={1}
+                        d3ForceConfig={{
+                          charge: {
+                            strength: -80, // Scaled down repulsion for minimap
+                            distanceMin: 10,
+                            distanceMax: 100
+                          },
+                          link: {
+                            distance: 30, // Scaled down link distance
+                            strength: 0.5
+                          },
+                          center: {
+                            strength: 0.3
+                          }
+                        }}
                       />
                     </div>
                   </div>
