@@ -7,6 +7,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const DATA_FILE = path.join(__dirname, 'thoughts-data.json');
 
+// Track last modification time for sync
+let lastModified = new Date().toISOString();
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -31,7 +34,8 @@ app.get('/api/thoughts', async (req, res) => {
     res.json({
       success: true,
       thoughts,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      lastModified
     });
   } catch (error) {
     console.error('Error reading thoughts:', error);
@@ -67,10 +71,14 @@ app.post('/api/thoughts', async (req, res) => {
     // Save new thoughts
     await fs.writeFile(DATA_FILE, JSON.stringify(thoughts, null, 2));
     
+    // Update last modified timestamp
+    lastModified = new Date().toISOString();
+    
     res.json({
       success: true,
       message: 'Thoughts saved successfully',
       timestamp: new Date().toISOString(),
+      lastModified,
       count: thoughts.length
     });
     
@@ -80,6 +88,39 @@ app.post('/api/thoughts', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to save thoughts'
+    });
+  }
+});
+
+// GET /api/sync - Check if data has been updated since timestamp
+app.get('/api/sync', async (req, res) => {
+  try {
+    const { since } = req.query;
+    const hasUpdates = !since || new Date(lastModified) > new Date(since);
+    
+    if (hasUpdates) {
+      const data = await fs.readFile(DATA_FILE, 'utf8');
+      const thoughts = JSON.parse(data);
+      res.json({
+        success: true,
+        hasUpdates: true,
+        thoughts,
+        lastModified,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      res.json({
+        success: true,
+        hasUpdates: false,
+        lastModified,
+        timestamp: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    console.error('Error checking sync:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check sync status'
     });
   }
 });
